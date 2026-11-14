@@ -1,0 +1,7 @@
+/.venv/
+/build/
+/dist/
+__pycache__/
+*.py[cod]
+/src/startup_card.bmp
+/src/startup_card.png
