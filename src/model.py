@@ -129,8 +129,8 @@ class Collection:
         self.items=[]
         self.serial=0
 
-    def add_bytes(self, blob, filename, name=None):
-        curves=parse_input(blob,filename)
+    def add_bytes(self, blob, filename, name=None, unit_choices=None):
+        curves=parse_input(blob,filename,unit_choices=unit_choices)
         buckets=[]
         counts=defaultdict(int)
         for c in curves:
@@ -154,8 +154,8 @@ class Collection:
             self.items.append(dataset);added.append(dataset)
         return added
 
-    def add_text(self,text,name):
-        return self.add_bytes(text.encode('utf-8-sig'),name+'.txt',distance_or_placeholder(name))
+    def add_text(self,text,name,unit_choices=None):
+        return self.add_bytes(text.encode('utf-8-sig'),name+'.txt',distance_or_placeholder(name),unit_choices)
 
     def waves(self):
         waves=list(dict.fromkeys(w for d in self.items for w in d.curves))

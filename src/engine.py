@@ -4,10 +4,44 @@ from io import BytesIO, StringIO
 import csv
 import math
 import re
+from decimal import Decimal
 import numpy as np
-from openpyxl import load_workbook
 
 NUMBER = r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?"
+
+
+class UnitChoiceRequired(ValueError):
+    def __init__(self, kind, key, context, conflict=False):
+        self.kind = kind
+        self.key = key
+        self.context = context
+        self.conflict = conflict
+        super().__init__(f'{context} 的单位' + ('标注冲突' if conflict else '未标明'))
+
+
+def distortion_unit_hints(text):
+    hints = set()
+    if re.search(r'[%％]|百分(?:数|比)|\bpercent(?:age)?\b', text, re.I):
+        hints.add('percent')
+    if re.search(r'小数|无量纲|(?<!百分)比例(?!尺)|\b(?:fractions?|fractional|ratios?|dimensionless|decimals?)\b', text, re.I):
+        hints.add('fraction')
+    return hints
+
+
+def resolve_data_unit(hints, allowed, kind, key, context, decisions):
+    if len(hints) == 1:
+        return next(iter(hints))
+    if decisions.get(key) in allowed:
+        return decisions[key]
+    raise UnitChoiceRequired(kind, key, context, conflict=len(hints) > 1)
+
+
+def wavelength_label(value, unit):
+    nm = unit.lower() in ('nm', '纳米', 'nanometer', 'nanometers', 'nanometre', 'nanometres')
+    micron = Decimal(value) / (1000 if nm else 1)
+    if not micron.is_finite() or micron <= 0:
+        raise ValueError('波长必须是正数。')
+    return f'{format(micron.normalize(), "f")} μm'
 
 
 def number(value):
@@ -39,7 +73,7 @@ class Curve:
         return {k: v for k, v in self.__dict__.items() if k not in ('first', 'raw')} | {'n': len(self.raw)}
 
 
-def parse_input(blob, filename):
+def parse_input(blob, filename, unit_choices=None):
     """Numerical samples are ALWAYS first and last columns only.
 
     Other cells may provide table boundaries; metadata supplies wavelength labels.
@@ -49,6 +83,7 @@ def parse_input(blob, filename):
         raise ValueError('文件超过 40 MB，请只保留畸变数据后导入。')
     suffix = filename.lower().rsplit('.', 1)[-1]
     if suffix in ('xlsx', 'xlsm'):
+        from openpyxl import load_workbook
         wb = load_workbook(BytesIO(blob), read_only=True, data_only=True)
         tables = []
         try:
@@ -80,7 +115,8 @@ def parse_input(blob, filename):
                     last = tokens[-2]+'%' if tokens[-1] in ('%','％') else tokens[-1]
                     rows.append([tokens[0],last])
                 elif ('畸变' in line or 'distortion' in line.lower()) and ('角度' in line or '半径' in line or 'angle' in line.lower() or 'radius' in line.lower()):
-                    rows.append(['角度（度）' if ('角度' in line or 'angle' in line.lower()) else '半径', '畸变(%)' if '%' in line else '畸变'])
+                    label = re.search(r'(?:畸变|distortion).*', line, re.I)
+                    rows.append(['角度（度）' if ('角度' in line or 'angle' in line.lower()) else '半径', label.group()])
                 else:
                     rows.append([line])
             tables=[('TXT',rows)]
@@ -89,6 +125,7 @@ def parse_input(blob, filename):
             tables = [('文本数据', list(csv.reader(StringIO(content), delimiter=delimiter)))]
     else:
         raise ValueError('支持 .xlsx、.xlsm、.csv、.tsv；旧版 .xls 请另存为 .xlsx。')
+    choices = unit_choices or {}
     curves = []
     for sheet, rows in tables:
         wave = '未标注波长'
@@ -97,15 +134,19 @@ def parse_input(blob, filename):
         points = []
         firstrow = lastrow = 0
         wave_at_start = wave
+        prose_hints = set()
 
         def finish():
             nonlocal points
             if len(points) >= 3:
                 fh, lh = header if header else ('第一列', '最后一列')
                 kind = 'angle' if ('角' in fh or 'angle' in fh.lower()) else 'normalized'
-                # Zemax sample has fraction values even though the prose calls the unit %.
-                # Explicit % headers/percent text in simple tables are already percentages.
-                unit = 'percent' if ('%' in lh or '％' in lh or any(p[3] for p in points)) else 'fraction'
+                hints = prose_hints | distortion_unit_hints(lh)
+                if any(p[3] for p in points):
+                    hints.add('percent')
+                unit = resolve_data_unit(hints, ('percent','fraction'), 'distortion',
+                                         ('distortion', sheet, firstrow),
+                                         f'{sheet} 第 {firstrow} 行起的畸变', choices)
                 curves.append(Curve(str(len(curves)), filename, sheet, wave_at_start,
                                     firstrow, lastrow, fh, lh, [p[1] for p in points],
                                     [p[2] for p in points], kind, unit))
@@ -117,11 +158,27 @@ def parse_input(blob, filename):
                 continue
             left = row[0] if len(row) else None
             text = ' '.join(str(row[i]).strip() for i in nonempty)
+            # Only explicit unit declarations qualify as prose hints. A line
+            # reporting the overall maximum need not use the same unit as the table.
+            if re.match(r'^\s*(?:畸变\s*单位|units?\s+(?:of|for)\s+distortion\b|distortion\s+(?:units?\b|is\s+(?:in|expressed|given)\b))', text, re.I):
+                finish()
+                prose_hints = distortion_unit_hints(text)
+                continue
             match = re.search(r'(?:波长|wavelength)\s*[:：]?\s*(' + NUMBER + r')\s*([^\s,，。]*)', text, re.I)
             if match:
                 finish()
-                unittext = match.group(2).rstrip('.') or 'μm'
-                wave = f'{float(match.group(1)):g} {unittext}'
+                unittext = match.group(2).rstrip('.').lower()
+                if unittext in ('μm', 'µm', 'um', '微米', 'micron', 'microns', 'micrometer',
+                                'micrometers', 'micrometre', 'micrometres'):
+                    wave = wavelength_label(match.group(1), 'μm')
+                elif unittext in ('nm', '纳米','nanometer','nanometers','nanometre','nanometres'):
+                    wave = wavelength_label(match.group(1), 'nm')
+                elif not unittext:
+                    unittext = resolve_data_unit(set(), ('nm', 'μm'), 'wavelength',
+                                                 ('wavelength', sheet, line), f'{sheet} 第 {line} 行波长 {match.group(1)}', choices)
+                    wave = wavelength_label(match.group(1), unittext)
+                else:
+                    raise ValueError(f'第 {line} 行无法识别波长单位“{unittext}”，请使用 nm 或 μm。')
                 continue
             # Header location is taken from the last nonempty header cell, never from
             # the intermediate numeric columns. The same column stays fixed for data.

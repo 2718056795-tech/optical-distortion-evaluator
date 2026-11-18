@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QDialog, QMenu, QMessageBox, QFileDialog,
     QVBoxLayout, QHBoxLayout, QGridLayout, QFrame, QLabel, QPushButton, QLineEdit,
     QPlainTextEdit, QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
-    QStatusBar, QScrollBar, QSizePolicy, QStyledItemDelegate, QStyleOptionViewItem,
+    QStatusBar, QScrollBar, QSizePolicy, QStyledItemDelegate, QStyleOptionViewItem, QToolTip,
 )
 
 import matplotlib
@@ -59,6 +59,7 @@ matplotlib.rcParams['font.weight'] = 'normal'
 matplotlib.rcParams['text.color'] = '#2d2d2b'
 
 from model import Collection, decode_text, distortion_grade, turning_grade, fit_grade  # noqa: E402
+from engine import UnitChoiceRequired
 
 HERE = Path(getattr(sys, '_MEIPASS', Path(__file__).resolve().parent))
 if getattr(sys, 'frozen', False):
@@ -98,8 +99,12 @@ def wave_nm(w):
     """'0.43 μm' → '430'，供表格分段控件与列头使用。"""
     if not w:
         return ''
-    m = re.search(r'\d+(?:\.\d+)?', w)
-    return str(int(round(float(m.group()) * 1000))) if m else w
+    m = re.fullmatch(r'(\d+(?:\.\d+)?)\s*(nm|纳米|[μµu]m|微米)', w.strip(), re.I)
+    if not m:
+        return w
+    from decimal import Decimal
+    scale = 1 if m.group(2).lower() in ('nm', '纳米') else 1000
+    return format((Decimal(m.group(1)) * scale).normalize(), 'f')
 
 
 USAGE_TEXT = (
@@ -157,7 +162,7 @@ class MiniSegmented(QWidget):
         self.values = []
         self.current = None
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setFixedSize(3 * self.SEG_W + 2, self.SEG_H + 2)
+        self.columns = 1
 
     def set_state(self, values, current):
         values = list(values)
@@ -165,8 +170,9 @@ class MiniSegmented(QWidget):
             return
         self.values = values
         self.current = current
-        lines = max(1, (len(values) + 2) // 3)
-        self.setFixedSize(3 * self.SEG_W + 2, lines * self.SEG_H + 2)
+        self.columns = 2 if len(values) == 4 else min(3, max(1, len(values)))
+        lines = max(1, math.ceil(len(values) / self.columns))
+        self.setFixedSize(self.columns * self.SEG_W + 2, lines * self.SEG_H + 2)
         self.update()
 
     def paintEvent(self, event):
@@ -183,9 +189,8 @@ class MiniSegmented(QWidget):
         f.setWeight(QFont.Weight.Bold)
         fm_num = ui_font(SERIF, 16)
         for idx, v in enumerate(self.values):
-            x = (idx % 3) * self.SEG_W + 1
-            y = (idx // 3) * self.SEG_H + 1
-            cx, cy = x + self.SEG_W / 2 - .5, y + self.SEG_H / 2 + 2
+            x = (idx % self.columns) * self.SEG_W + 1
+            y = (idx // self.columns) * self.SEG_H + 1
             if v == self.current:
                 p.setBrush(QBrush(QColor('white')))
                 pen = QPen(QColor('#d9d9de'))
@@ -206,8 +211,8 @@ class MiniSegmented(QWidget):
             return
         column = int(event.position().x() // self.SEG_W)
         row = int(event.position().y() // self.SEG_H)
-        idx = row * 3 + column
-        if row >= 0 and 0 <= column < 3 and 0 <= idx < len(self.values) and self.command:
+        idx = row * self.columns + column
+        if row >= 0 and 0 <= column < self.columns and 0 <= idx < len(self.values) and self.command:
             event.accept()
             self.command(self.values[idx])
         else:
@@ -437,7 +442,10 @@ class PasteDialog(QDialog):
             return
         try:
             filename = self.source_path.name if self.source_path else '粘贴数据.txt'
-            added = self.app.model.add_bytes(text.encode('utf-8-sig'), filename, name=name)
+            blob = text.encode('utf-8-sig')
+            added = add_with_units(self, self.app.model, blob, filename, name)
+            if added is None:
+                return
             self.added = added
             self.app.refresh()
             self.accept()
@@ -449,6 +457,31 @@ class PasteDialog(QDialog):
             self.reject()
         else:
             super().keyPressEvent(event)
+
+
+def add_with_units(parent, model, blob, filename, name):
+    choices = {}
+    while True:
+        try:
+            return model.add_bytes(blob, filename, name=name, unit_choices=choices)
+        except UnitChoiceRequired as exc:
+            issue = exc
+        box = QMessageBox(parent)
+        box.setWindowTitle('确认数据单位')
+        box.setText(str(issue) + '，请按原始数据选择。')
+        if issue.kind == 'distortion':
+            options = [('百分数（0.5 表示 0.5%）', 'percent'), ('小数比例（0.005 表示 0.5%）', 'fraction')]
+        else:
+            options = [('纳米（nm）', 'nm'), ('微米（μm）', 'μm')]
+        buttons = {box.addButton(label, QMessageBox.ButtonRole.ActionRole): unit for label, unit in options}
+        cancel = box.addButton('取消', QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(cancel)
+        box.setEscapeButton(cancel)
+        box.exec()
+        choice = buttons.get(box.clickedButton())
+        if choice is None:
+            return None
+        choices[issue.key] = choice
 
 
 # ---------- 弹窗：使用说明 ----------
@@ -573,7 +606,7 @@ class DataRowDelegate(QStyledItemDelegate):
 # ---------- 主窗口 ----------
 
 class App(QMainWindow):
-    COLS = [('序号', 48), ('图例备注(双击修改)', 176), ('波长 nm', 146), ('最大畸变', 100), ('拐点个数', 90), ('相对偏差', 90)]
+    COLS = [('序号', 48), ('图例备注(双击修改)', 176), ('波长 nm', 84), ('最大畸变', 100), ('拐点个数', 90), ('相对偏差', 90)]
 
     def __init__(self):
         super().__init__()
@@ -866,6 +899,8 @@ class App(QMainWindow):
         self.fig = Figure(figsize=(7.2, 5.4), dpi=100)
         self.fig.patch.set_facecolor('white')
         self.mpl_canvas = FigureCanvas(self.fig)
+        self._frame_axes = self._frame_renderer = self._plain_plot = None
+        self.mpl_canvas.mpl_connect('draw_event', self._remember_plot_frame)
         self.mpl_canvas.setStyleSheet('border:none;background:white;')
         self.mpl_canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.mpl_canvas.mpl_connect('pick_event', self.on_legend_pick)
@@ -911,6 +946,16 @@ class App(QMainWindow):
                 self._hover_id = None
                 self.show_source(rebuild_plot=False)
         elif obj is self.mpl_canvas:
+            if event.type() == QEvent.Type.ToolTip:
+                scale = self.mpl_canvas.device_pixel_ratio
+                x = event.pos().x() * scale
+                y = self.fig.bbox.height - event.pos().y() * scale
+                tip = self._legend_hover_text(x, y)
+                if tip:
+                    QToolTip.showText(event.globalPos(), tip, self.mpl_canvas)
+                else:
+                    QToolTip.hideText()
+                return True
             if event.type() == QEvent.Type.Resize and not self._resize_pending:
                 self._resize_pending = True
                 QTimer.singleShot(150, self._resize_redraw)
@@ -951,8 +996,11 @@ class App(QMainWindow):
         HelpDialog(self).exec()
 
     def load_sample(self):
-        self.model.add_bytes(SAMPLE.read_bytes(), SAMPLE.name, name='示例')
-        self.refresh()
+        try:
+            if add_with_units(self, self.model, SAMPLE.read_bytes(), SAMPLE.name, '示例'):
+                self.refresh()
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, '无法载入示例', str(exc))
 
     # ===== 数据 / KPI =====
 
@@ -978,7 +1026,7 @@ class App(QMainWindow):
         wave = self.wave
         single = None
         d = next((d for d in self.model.items if d.id == self._selected_id), None)
-        if d is not None:
+        if d is not None and d.visible:
             w = d.effective_wave(wave)
             r = d.result(w) if w else None
             if r:
@@ -1041,6 +1089,7 @@ class App(QMainWindow):
         f_num = ui_font(SERIF, 16)
         f_cjk = ui_font(SERIF_CJK, 16)
         f_cjk.setWeight(QFont.Weight.Normal)
+        wave_width = self.COLS[2][1]
         for i, d in enumerate(self.model.items):
             w = d.effective_wave(wave)
             r = d.result(w) if w else None
@@ -1060,17 +1109,19 @@ class App(QMainWindow):
 
             item(0, str(i + 1), f_num, normal)
             item(1, d.name, f_cjk, normal)
-            item(3, f"{r['dmax']:.4f}%" if r else '—', f_num,
-                 distortion_grade(r['dmax'])[2] if (r and d.visible) else disabled)
-            item(4, str(r['turns']['count']) if r else '—', f_num,
-                 turning_grade(r['turns']['count'])[2] if (r and d.visible) else disabled)
-            item(5, f"{r['relative_error']:.1f}%" if (r and r['relative_error'] is not None) else '—',
-                 f_num, fit_grade(r['relative_error'])[2] if (r and d.visible) else disabled)
+            for col in (3, 4, 5):
+                item(col, '', f_num, normal)
+            self._update_row_metrics(i, d, r)
             # 波长列：行内分段控件 / 超过 6 个波长时为弹出菜单
+            row_height = 48
             if d.curves:
                 values = d.own_waves()
                 current = d.effective_wave(wave)
-                if len(values) > 6:
+                if len(values) == 1:
+                    self.table.removeCellWidget(i, 2)
+                    item(2, wave_nm(current) or '—', f_num, normal)
+                elif len(values) > 6:
+                    self.table.takeItem(i, 2)
                     lbl = ClickLabel(f'{wave_nm(current)} ⌄')
                     lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
                     lbl.setFont(f_cjk)
@@ -1078,10 +1129,13 @@ class App(QMainWindow):
                     lbl.setStyleSheet(f'background:{rowbg};color:{normal};border:none;')
                     lbl.on_clicked(lambda e, ident=d.id, lbl=lbl: self._wave_menu(ident, lbl))
                     self.table.setCellWidget(i, 2, lbl)
+                    wave_width = max(wave_width, lbl.sizeHint().width() + 8)
                 else:
+                    self.table.takeItem(i, 2)
                     seg = MiniSegmented(command=lambda v, ident=d.id: self._set_row_wave(ident, v))
                     seg.set_state(values, current)
-                    self.table.setRowHeight(i, max(48, seg.height() + 8))
+                    row_height = max(48, seg.height() + 8)
+                    wave_width = max(wave_width, seg.width() + 6)
                     wrap = QWidget()
                     hl = QHBoxLayout(wrap)
                     hl.setContentsMargins(0, 0, 0, 0)
@@ -1091,15 +1145,61 @@ class App(QMainWindow):
                     wrap.setStyleSheet(f'background:{rowbg};border:none;')
                     self.table.setCellWidget(i, 2, wrap)
             else:
+                self.table.takeItem(i, 2)
                 self.table.setCellWidget(i, 2, None)
+            self.table.setRowHeight(i, row_height)
+        self.table.setColumnWidth(2, wave_width)
         self.show_source()
 
+    def _update_row_metrics(self, row, dataset, result):
+        error = result['relative_error'] if result else None
+        values = (
+            (f"{result['dmax']:.4f}%", distortion_grade(result['dmax'])[2]),
+            (str(result['turns']['count']), turning_grade(result['turns']['count'])[2]),
+            (f"{error:.1f}%" if error is not None else '—', fit_grade(error)[2]),
+        ) if result else [('—', MUTED)] * 3
+        for col, (text, color) in enumerate(values, 3):
+            cell = self.table.item(row, col)
+            cell.setText(text)
+            cell.setForeground(QColor(color if dataset.visible else '#8a9aa5'))
+
     def _set_row_wave(self, ident, w):
-        d = next((d for d in self.model.items if d.id == ident), None)
-        if d is None:
+        row = next((i for i, d in enumerate(self.model.items) if d.id == ident), None)
+        if row is None:
             return
+        d = self.model.items[row]
+        if w not in d.curves or d.effective_wave(self.wave) == w:
+            return
+        result = d.result(w)
         d.wave_sel = w
-        self.refresh()
+        cell = self.table.cellWidget(row, 2)
+        if isinstance(cell, ClickLabel):
+            cell.setText(f'{wave_nm(w)} ⌄')
+        elif cell is not None:
+            cell.findChild(MiniSegmented).set_state(d.own_waves(), w)
+        self._update_row_metrics(row, d, result)
+        self._update_kpi()
+        for dataset, design, fit, markers in self._chart_lines:
+            if dataset is not d:
+                continue
+            for line, points in ((design, result['samples']), (fit, result['fit'])):
+                line.set_data([p[1] for p in points], [p[0] for p in points])
+            turns = result['turns']['points']
+            while len(markers) > len(turns):
+                markers.pop().remove()
+            for i, point in enumerate(turns):
+                xy = (point['distortion'], point['rho'])
+                if i < len(markers):
+                    markers[i].set_offsets([xy])
+                else:
+                    markers.append(self.ax.scatter(*xy, s=52, facecolor='white',
+                        edgecolor=design.get_color(), linewidth=1.5,
+                        visible=design.get_visible(), zorder=7 if ident == self._selected_id else 4))
+            self.ax.relim()
+            self.ax.autoscale_view(scalex=True, scaley=False)
+            self._reset_hover_readout()
+            self._paint_curve_change()
+            break
 
     def _wave_menu(self, ident, anchor):
         d = next((d for d in self.model.items if d.id == ident), None)
@@ -1119,10 +1219,12 @@ class App(QMainWindow):
         if it.column() == 0:
             # 序号列：切换该条数据显示
             d.visible = not d.visible
+            if not d.visible and self._selected_id == d.id:
+                self._selected_id = None
             self.refresh()
             return
         # 立即切换选中状态（双击改名在 _on_row_double_click 里会重新选中，无副作用）
-        self._selected_id = None if self._selected_id == d.id else d.id
+        self._selected_id = None if self._selected_id == d.id or not d.visible else d.id
         self.show_source(rebuild_plot=False)
 
     def _on_row_double_click(self, it):
@@ -1196,6 +1298,10 @@ class App(QMainWindow):
     def _solo(self, ident):
         for d in self.model.items:
             d.visible = (d.id == ident)
+            if d.visible:
+                d._vis_d = d._vis_f = True
+        if self._selected_id != ident:
+            self._selected_id = None
         self.refresh()
 
     def show_source(self, rebuild_plot=True):
@@ -1206,7 +1312,58 @@ class App(QMainWindow):
             self.redraw()
         else:
             self._apply_line_styles()
-            self.mpl_canvas.draw_idle()
+            self._paint_selection()
+
+    def _remember_plot_frame(self, event):
+        if event.canvas is not self.mpl_canvas or event.canvas.is_saving():
+            return
+        self._frame_axes = getattr(self, 'ax', None)
+        self._frame_renderer = event.renderer
+        self._plain_plot = (event.canvas.copy_from_bbox(self.ax.bbox)
+                            if self._frame_axes is not None and self._selected_id is None else None)
+
+    def _frame_is_current(self):
+        canvas = self.mpl_canvas
+        return (self._frame_axes is self.ax and self._frame_renderer is canvas.get_renderer()
+                and not canvas._draw_pending and not self._resize_pending)
+
+    def _paint_selection(self):
+        if self._plain_plot is None or not self._frame_is_current():
+            self._paint_curve_change()
+            return
+        self.mpl_canvas.restore_region(self._plain_plot)
+        for dataset, design, fit, markers in self._chart_lines:
+            if dataset.id == self._selected_id:
+                for artist in (fit, design, *markers):
+                    self.ax.draw_artist(artist)
+                break
+        self.mpl_canvas.blit(self.ax.bbox)
+
+    def _paint_curve_change(self):
+        # Keep the legend pixels while repainting the axes, including changed ticks.
+        self._plain_plot = None
+        canvas = self.mpl_canvas
+        legend = getattr(self, '_active_legend', None)
+        if legend is None or not self._frame_is_current():
+            canvas.draw_idle()
+            return
+        renderer = self._frame_renderer
+        left = math.floor(legend.get_window_extent(renderer).x0)
+        if left <= self.ax.bbox.x1 or left >= self.fig.bbox.width:
+            canvas.draw_idle()
+            return
+        legend_strip = Bbox.from_extents(left, 0, self.fig.bbox.width, self.fig.bbox.height)
+        saved = canvas.copy_from_bbox(legend_strip)
+        self.fig.patch.draw(renderer)
+        legend.set_visible(False)
+        try:
+            self.ax.draw(renderer)
+        finally:
+            legend.set_visible(True)
+        canvas.restore_region(saved)
+        if self._selected_id is None:
+            self._plain_plot = canvas.copy_from_bbox(self.ax.bbox)
+        canvas.blit(self.fig.bbox)
 
     # ===== 图表 =====
 
@@ -1269,12 +1426,26 @@ class App(QMainWindow):
         leg = getattr(self, '_active_legend', None)
         if leg is None:
             return
-        width, height = max(1, self.mpl_canvas.width()), max(1, self.mpl_canvas.height())
+        width, height = self.fig.bbox.size
+        scale = self.mpl_canvas.device_pixel_ratio
         overflow = self.legend_scroll.maximum() > 0
-        top = height - 14 + self.legend_scroll.value() if overflow else (height + self._legend_height) / 2
-        right = width - (22 if overflow else 5)
+        top = height + (self.legend_scroll.value() - 14) * scale if overflow else (height + self._legend_height) / 2
+        right = width - (22 if overflow else 5) * scale
         leg.set_bbox_to_anchor((right / width, top / height), transform=self.fig.transFigure)
         self.mpl_canvas.draw_idle()
+
+    def _legend_hover_text(self, x, y):
+        leg = getattr(self, '_active_legend', None)
+        if leg is None or x < self._legend_left or not self._legend_clip_bbox.contains(x, y):
+            return ''
+        renderer = self.fig.canvas.get_renderer()
+        for artists, handle in zip(self._legend_toggle, self._legend_handles):
+            parts = artists[0]
+            if parts[-1].get_text() != handle.get_label():
+                box = Bbox.union([part.get_window_extent(renderer) for part in parts])
+                if box.contains(x, y):
+                    return handle.get_label()
+        return ''
 
     def _apply_line_styles(self):
         # 所有曲线默认同等亮度；选中行对应的曲线仅加粗作为提醒，不压暗其他曲线
@@ -1295,13 +1466,17 @@ class App(QMainWindow):
                 sc.set_zorder(7 if (sel and on) else 4)
 
     def show_all_lines(self):
+        restore_rows = any(not d.visible for d in self.model.items)
+        for d in self.model.items:
+            d.visible = d._vis_d = d._vis_f = True
+        if restore_rows:
+            self.refresh()
+            return
         for d, dl, fl, scs in getattr(self, '_chart_lines', []):
             dl.set_visible(True)
             fl.set_visible(True)
             for sc in scs:
                 sc.set_visible(True)
-            d._vis_d = True
-            d._vis_f = True
         self._apply_line_styles()
         if getattr(self, 'ax', None) is not None:
             self._make_legend(self.ax)
@@ -1319,31 +1494,63 @@ class App(QMainWindow):
         old = ax.get_legend()
         if old is not None:
             old.remove()
-        leg = ax.legend(handles=handles, loc='upper right', bbox_to_anchor=(.995, .98),
+        compact = self.mpl_canvas.width() < 680
+        leg = ax.legend(handles=handles, labels=[h.get_label() for h in handles],
+                        loc='upper right', bbox_to_anchor=(.995, .98),
                         bbox_transform=self.fig.transFigure,
                         ncol=2, frameon=False, handler_map={Line2D: _CheckHandler()},
-                        fontsize=11.52, handlelength=3.0, handletextpad=.6,
-                        columnspacing=1.2, labelspacing=.7, borderaxespad=0)
+                        fontsize=11.52, handlelength=2.1 if compact else 3.0,
+                        handletextpad=.35 if compact else .6,
+                        columnspacing=.55 if compact else 1.2, labelspacing=.7, borderaxespad=0)
         # The legend must never participate in the curve axes' vertical layout.
         leg.set_in_layout(False)
         self._active_legend = leg
-        extent = leg.get_window_extent(self.fig.canvas.get_renderer())
+        renderer = self.fig.canvas.get_renderer()
+        texts = leg.get_texts()
+        for text in texts:
+            text.set_parse_math(False)
+        extent = leg.get_window_extent(renderer)
         self._legend_height = extent.height
-        width, height = max(1, self.mpl_canvas.width()), max(1, self.mpl_canvas.height())
-        viewport_height = max(1, height - 28)
+        width, height = self.fig.bbox.size
+        scale = self.mpl_canvas.device_pixel_ratio
+        viewport_height = max(1, self.mpl_canvas.height() - 28)
         self.legend_scroll.blockSignals(True)
-        self.legend_scroll.setRange(0, max(0, math.ceil(extent.height - viewport_height)))
+        self.legend_scroll.setRange(0, max(0, math.ceil(extent.height / scale - viewport_height)))
         self.legend_scroll.setPageStep(viewport_height)
         self.legend_scroll.blockSignals(False)
         overflow = self.legend_scroll.maximum() > 0
-        self.legend_scroll.setGeometry(width - 12, 14, 12, viewport_height)
+        self.legend_scroll.setGeometry(self.mpl_canvas.width() - 12, 14, 12, viewport_height)
         self.legend_scroll.setVisible(overflow)
         self.legend_scroll.raise_()
-        self._legend_clip_bbox = Bbox.from_bounds(0, 14, width - (16 if overflow else 0), viewport_height)
+        # Use renderer pixels for text measurement, axes and clipping. Qt's scrollbar
+        # uses logical pixels. Reserve at least half of the canvas for axes/margins.
+        right = width - (22 if overflow else 5) * scale
+        budget = right - width * .50 - 14 * scale
+        if extent.width > budget and texts:
+            cols = (texts[:len(texts)//2], texts[len(texts)//2:])
+            natural = [max(t.get_window_extent(renderer).width for t in col) for col in cols]
+            available = max(0, budget - (extent.width - sum(natural)) - 2 * scale)
+            for i, col in enumerate(cols):
+                limit = max(available / 2, available - natural[1-i])
+                for text in col:
+                    original = text.get_text()
+                    if text.get_window_extent(renderer).width <= limit:
+                        continue
+                    lo, hi = 0, len(original)
+                    while lo < hi:
+                        keep = (lo + hi + 1) // 2
+                        text.set_text(original[:(keep+1)//2] + '…' + original[len(original)-keep//2:])
+                        if text.get_window_extent(renderer).width <= limit:
+                            lo = keep
+                        else:
+                            hi = keep - 1
+                    text.set_text(original[:(lo+1)//2] + '…' + original[len(original)-lo//2:])
+            extent = leg.get_window_extent(renderer)
+        self._legend_clip_bbox = Bbox.from_bounds(0, 14 * scale, width - (16 if overflow else 0) * scale, viewport_height * scale)
         for artist in leg.findobj():
             artist.set_clip_box(self._legend_clip_bbox)
             artist.set_clip_on(True)
-        self._legend_left = width - (22 if overflow else 5) - extent.width
+        self._legend_left = right - extent.width
         self._position_legend()
         self._legend_toggle = []
         for (art_h, art_t), target in zip(zip(leg.legend_handles, leg.get_texts()), targets):
@@ -1385,17 +1592,16 @@ class App(QMainWindow):
             fig.tight_layout()
             self.mpl_canvas.draw_idle()
             return
-        def wave_tag(d, w):
-            # 图例不标注波长
-            return ''
         handles = []
         targets = []
         design_lines = []
         fit_lines = []
         scatter_lines = []
-        for i, (d, w, r) in enumerate(results):
-            color = COLORS[i % len(COLORS)]
-            fitc = TINTS[i % len(TINTS)]
+        for d, w, r in results:
+            # Production IDs are monotonically increasing import serials.
+            color_index = (int(d.id) - 1 if d.id.isdecimal() else sum(d.id.encode('utf-8'))) % len(COLORS)
+            color = COLORS[color_index]
+            fitc = TINTS[color_index]
             # 拟合线先画、用同族浅色，归属一目了然
             fitl, = ax.plot([v[1] for v in r['fit']], [v[0] for v in r['fit']], color=fitc, lw=2,
                             solid_capstyle='round', solid_joinstyle='round', zorder=2)
@@ -1412,14 +1618,11 @@ class App(QMainWindow):
             design_lines.append(dl)
             fit_lines.append(fitl)
             scatter_lines.append(scs)
-            label = d.name if len(d.name) <= 23 else d.name[:21] + '…'
-            handles.append(Line2D([0], [0], color=color, lw=2.6, label=label + wave_tag(d, w)))
+            handles.append(Line2D([0], [0], color=color, lw=2.6, label=d.name))
             targets.append(dl)
-        for i, (d, w, _) in enumerate(results):
-            label = d.name if len(d.name) <= 17 else d.name[:15] + '…'
-            handles.append(Line2D([0], [0], color=TINTS[i % len(TINTS)], lw=2,
-                                  label=f'拟合（{label}{wave_tag(d, w)}）'))
-            targets.append(fit_lines[i])
+        for (d, _, _), line in zip(results, fit_lines):
+            handles.append(Line2D([0], [0], color=line.get_color(), lw=2, label=f'拟合（{d.name}）'))
+            targets.append(line)
         # 图例放图表右侧，两列：左列待拟合、右列拟合
         self._legend_handles = handles
         self._legend_targets = targets
@@ -1440,12 +1643,8 @@ class App(QMainWindow):
         self._apply_line_styles()
         fig.tight_layout()
         # 量出图例实际像素宽度，坐标轴右缘精确让到图例左侧，始终紧贴
-        figw = max(1, self.mpl_canvas.width())
-        figh = max(1, self.mpl_canvas.height())
-        fig.set_size_inches(figw / self.mpl_canvas.figure.dpi, figh / self.mpl_canvas.figure.dpi)
-        fig.canvas.draw()
-        right_px = self._legend_left - 14
-        fig.subplots_adjust(right=max(.34, right_px / figw))
+        right_px = self._legend_left - 14 * self.mpl_canvas.device_pixel_ratio
+        fig.subplots_adjust(right=right_px / fig.bbox.width)
         self.mpl_canvas.draw_idle()
 
     # ===== 导出 =====
@@ -1455,20 +1654,31 @@ class App(QMainWindow):
         fig, leg = self.fig, getattr(self, '_active_legend', None)
         size, position = fig.get_size_inches().copy(), self.ax.get_position().frozen()
         clip_states = [(a, a.get_clip_on(), a.get_clip_box()) for a in leg.findobj()] if leg else []
+        screen_labels = [text.get_text() for text in leg.get_texts()] if leg else []
         try:
             if leg is not None:
-                old_height = size[1] * fig.dpi
-                height = max(old_height, self._legend_height + 28)
-                fig.set_size_inches(size[0], height / fig.dpi, forward=False)
-                plot_height = position.height * old_height / height
-                self.ax.set_position([position.x0, (1 - plot_height) / 2, position.width, plot_height])
+                for text, handle in zip(leg.get_texts(), self._legend_handles):
+                    full = handle.get_label()
+                    text.set_text('\n'.join(full[i:i+64] for i in range(0, len(full), 64)))
+                bounds = leg.get_window_extent(fig.canvas.get_renderer())
+                old_width, old_height = size * fig.dpi
+                scale = self.mpl_canvas.device_pixel_ratio
+                width = max(old_width, position.x1 * old_width + bounds.width + 24 * scale)
+                height = max(old_height, bounds.height + 28 * scale)
+                fig.set_size_inches(width / fig.dpi, height / fig.dpi, forward=False)
+                self.ax.set_position([position.x0 * old_width / width,
+                                      (position.y0 * old_height + (height - old_height) / 2) / height,
+                                      position.width * old_width / width, position.height * old_height / height])
                 for artist, _, _ in clip_states:
                     artist.set_clip_on(False)
-                leg.set_bbox_to_anchor((.995, (1 + self._legend_height / height) / 2), transform=fig.transFigure)
+                leg.set_bbox_to_anchor((1 - 5 * scale / width, (1 + bounds.height / height) / 2), transform=fig.transFigure)
             fig.savefig(path, format=format, dpi=dpi, facecolor='white')
         finally:
             fig.set_size_inches(*size, forward=False)
             self.ax.set_position(position)
+            if leg is not None:
+                for text, label in zip(leg.get_texts(), screen_labels):
+                    text.set_text(label)
             for artist, enabled, box in clip_states:
                 artist.set_clip_box(box)
                 artist.set_clip_on(enabled)
@@ -1707,7 +1917,13 @@ def main():
                         QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
                         app.processEvents()
                     return win.table.cellWidget(row, 2).findChild(MiniSegmented)
+                axes_before_wave, legend_before_wave = win.ax, win._active_legend
+                other_wave_cell = win.table.cellWidget(1, 2)
+                first_design = win._chart_lines[0][1]
                 wave_control = click_wave(0, 0)
+                assert win.ax is axes_before_wave and win._active_legend is legend_before_wave
+                assert win.table.cellWidget(1, 2) is other_wave_cell
+                assert win._chart_lines[0][1] is first_design
                 assert win.model.items[0].effective_wave(win.wave) == '0.44 μm'
                 assert wave_control.current == '0.44 μm'
                 assert win.model.items[1].effective_wave(win.wave) == '0.48 μm'
@@ -1789,11 +2005,22 @@ def main():
                 win.on_motion(SimpleNamespace(inaxes=win.ax, xdata=.5, ydata=.25))
                 assert win.hover_x.text() == '—' and win.hover_y.text() == '—'
                 win.show_all_lines()
+                win._on_row_click(win.table.item(1, 3))
+                win._toggle_legend_item(1)
+                win._toggle_legend_item(1 + len(win._chart_lines))
+                win._on_row_click(win.table.item(1, 0))
+                assert win._selected_id is None and not win.model.items[1].visible
+                assert win.kpi_scope.text() == '全部数据 · 各项最差'
+                assert win.model.items[1].id not in [d.id for d, _, _ in win.row_results(win.wave)]
+                win._toggle_legend_item(0)
                 win._solo(first)
                 assert sum(d.visible for d in win.model.items) == 1
-                for d in win.model.items:
-                    d.visible = True
-                win.refresh()
+                assert win._chart_lines[0][1].get_visible()
+                win.show_all_lines()
+                assert all(d.visible and d._vis_d and d._vis_f for d in win.model.items)
+                assert len(win._chart_lines) == len(win.model.items)
+                assert all(dl.get_visible() and fl.get_visible() and all(sc.get_visible() for sc in scs)
+                           for _, dl, fl, scs in win._chart_lines)
                 original_items, original_selected = win.model.items, win._selected_id
                 def kpi_sample(ident, name, distortion, turns, error):
                     result = {'dmax': distortion, 'turns': {'count': turns}, 'relative_error': error}

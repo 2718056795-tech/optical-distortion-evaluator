@@ -1,13 +1,64 @@
 from pathlib import Path
 import unittest
 import numpy as np
-from engine import Curve,fit_curve,parse_input
+from engine import Curve,fit_curve,parse_input,UnitChoiceRequired
 from model import Collection,Dataset,distortion_grade,distance_name,fit_grade,turning_points,turning_grade
 
 SAMPLE=Path(__file__).resolve().parent.parent/'examples/畸变样例.txt'
 
 
 class ModelTests(unittest.TestCase):
+    def test_declared_distortion_units_and_file_paste_agree(self):
+        plain = 'Angle  Distortion\n0  0\n10  0.05\n20  0.24\n30  0.72'
+        for decl, maximum in [('畸变单位是百分比。', .72), ('Distortion is expressed as percentage.', .72),
+                              ('Units of distortion are fractions.', 72.0)]:
+            data = decl + '\n' + plain
+            model = Collection()
+            a = model.add_bytes(data.encode('utf-8'), 'case.txt')[0]
+            b = model.add_text(data, 'case')[0]
+            self.assertAlmostEqual(a.row_result()['dmax'], maximum)
+            self.assertAlmostEqual(b.row_result()['dmax'], maximum)
+        for header, maximum in [('Angle Distortion (fraction)',72.), ('Angle  Distortion (%)',.72)]:
+            data = plain.replace('Angle  Distortion', header)
+            self.assertAlmostEqual(Collection().add_text(data,'case')[0].row_result()['dmax'],maximum)
+
+    def test_unresolved_units_cancel_without_adding_and_override_only_matters_for_that_block(self):
+        clear = 'Wavelength: 440 nm\nAngle  Distortion (%)\n0  0\n10  .2\n20  .72'
+        for header, conflict in [('Angle  Distortion', False), ('畸变单位是小数比例\nAngle  Distortion (%)', True)]:
+            text = clear+'\nWavelength: 460 nm\n'+header+'\n0  0\n10  .002\n20  .0072'
+            model = Collection()
+            with self.assertRaises(UnitChoiceRequired) as issue:
+                model.add_text(text, 'case')
+            self.assertEqual(model.items, [])
+            self.assertEqual(issue.exception.kind, 'distortion')
+            self.assertEqual(issue.exception.conflict, conflict)
+            dataset = model.add_text(text, 'case', unit_choices={issue.exception.key: 'fraction'})[0]
+            self.assertEqual(dataset.own_waves(), ['0.44 μm','0.46 μm'])
+            for wave in dataset.own_waves():
+                self.assertAlmostEqual(dataset.result(wave)['dmax'], .72)
+
+    def test_wavelength_units_and_missing_unit(self):
+        data='Wavelength: {}\nAngle  Distortion (%)\n0  0\n10  .2\n20  .72'
+        c=Collection()
+        for wave in ('440 nm','0.44 um','0.440 µm','0.440000 μm'):
+            c.add_text(data.format(wave), 'case')
+        self.assertEqual(c.waves(), ['0.44 μm'])
+        self.assertEqual(len(c.visible_results('0.44 μm')),4)
+        with self.assertRaises(UnitChoiceRequired) as issue:
+            c.add_text(data.format('440'),'case')
+        self.assertEqual(issue.exception.kind, 'wavelength')
+        self.assertEqual(len(c.items),4)
+        c.add_text(data.format('440'),'case',unit_choices={issue.exception.key:'nm'})
+        self.assertEqual(len(c.visible_results('0.44 μm')),5)
+        text=data.format('440')+'\n'+data.format('0.46')
+        units={issue.exception.key:'nm'}
+        with self.assertRaises(UnitChoiceRequired) as second:
+            c.add_text(text,'mixed',unit_choices=units)
+        self.assertNotEqual(second.exception.key,issue.exception.key)
+        units[second.exception.key]='μm'
+        pair=c.add_text(text,'mixed',unit_choices=units)[0]
+        self.assertEqual(pair.own_waves(), ['0.44 μm','0.46 μm'])
+
     def test_turning_color_boundaries(self):
         for count,key in [(0,'green'),(1,'green'),(2,'yellow'),(3,'red'),(4,'red')]:
             self.assertEqual(turning_grade(count)[0],key)
